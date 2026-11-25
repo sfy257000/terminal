@@ -1,13 +1,44 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..2d3185e 100644
+index 81322b8..d8891b6 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
-@@ -187,9 +187,23 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -12,6 +12,29 @@
+ 
+ using namespace Microsoft::Console::TSF;
+ 
++// GH#20936 debug: append one line per TSF event to %TEMP%\wt-tsf-20936.log
++static void tsfLog(const std::string& msg) noexcept
++try
++{
++    static const auto path = [] {
++        wchar_t buf[MAX_PATH];
++        const auto n = GetTempPathW(MAX_PATH, buf);
++        return std::wstring{ buf, n } + L"wt-tsf-20936.log";
++    }();
++    const auto line = fmt::format("{} t={} {}
++", GetTickCount64(), GetCurrentThreadId(), msg);
++    wil::unique_hfile f{ CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
++    if (f)
++    {
++        DWORD written;
++        WriteFile(f.get(), line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
++    }
++}
++catch (...)
++{
++}
++#define TSFLOG(...) tsfLog(fmt::format(__VA_ARGS__))
++
+ static void TfSelectionClose(const TF_SELECTION* sel)
+ {
+     if (const auto r = sel->range)
+@@ -187,15 +210,34 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
 -    _provider = provider;
 -
++    TSFLOG("Focus enter provider={} cur={} comps={} pending={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount);
      THROW_IF_FAILED(_threadMgrEx->SetFocus(_documentMgr.get()));
 +
 +    // GH#20936: If the window lost focus mid-composition, Unfocus()'s TerminateComposition() can fail
@@ -19,12 +50,108 @@ index 81322b8..2d3185e 100644
 +    if (_compositions > 0 && _ownerCompositionServices)
 +    {
 +        _provider.reset();
-+        std::ignore = _ownerCompositionServices->TerminateComposition(nullptr);
++        const auto hrTerm = _ownerCompositionServices->TerminateComposition(nullptr);
++        TSFLOG("Focus stale composition TerminateComposition hr={:#x} comps={} pending={}", static_cast<uint32_t>(hrTerm), _compositions, _editSessionCompositionUpdate.referenceCount);
 +        _compositions = 0;
 +        FlushPendingComposition();
 +    }
 +
 +    _provider = provider;
++    TSFLOG("Focus leave comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
  }
  
  void Implementation::Unfocus(IDataProvider* provider)
+ {
++    TSFLOG("Unfocus enter provider={} cur={} comps={} pending={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount);
+     if (!_provider || _provider != provider)
+     {
++        TSFLOG("Unfocus skipped (provider mismatch)");
+         return;
+     }
+ 
+@@ -221,12 +263,18 @@ void Implementation::Unfocus(IDataProvider* provider)
+ 
+     if (_compositions > 0 && _ownerCompositionServices)
+     {
+-        std::ignore = _ownerCompositionServices->TerminateComposition(nullptr);
++        const auto hrTerm = _ownerCompositionServices->TerminateComposition(nullptr);
++        TSFLOG("Unfocus TerminateComposition hr={:#x}", static_cast<uint32_t>(hrTerm));
+     }
++    TSFLOG("Unfocus leave comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
+ }
+ 
+ bool Implementation::HasActiveComposition() const noexcept
+ {
++    if (_compositions > 0)
++    {
++        TSFLOG("HasActiveComposition=true comps={} (key swallowed)", _compositions);
++    }
+     return _compositions > 0;
+ }
+ 
+@@ -247,7 +295,9 @@ void Implementation::FlushPendingComposition() noexcept
+     // references the proxy. Letting that request run afterwards is harmless, because
+     // _doCompositionUpdate() derives everything from the current state of the context.
+     HRESULT hr = S_OK;
+-    LOG_IF_FAILED(_context->RequestEditSession(_clientId, &_editSessionCompositionUpdate, TF_ES_READWRITE | TF_ES_SYNC, &hr));
++    const auto hrReq = _context->RequestEditSession(_clientId, &_editSessionCompositionUpdate, TF_ES_READWRITE | TF_ES_SYNC, &hr);
++    TSFLOG("FlushPendingComposition hrReq={:#x} hr={:#x}", static_cast<uint32_t>(hrReq), static_cast<uint32_t>(hr));
++    LOG_IF_FAILED(hrReq);
+     LOG_IF_FAILED(hr);
+ }
+ 
+@@ -405,6 +455,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+ try
+ {
+     _compositions++;
++    TSFLOG("OnStartComposition comps={} pending={} provider={}", _compositions, _editSessionCompositionUpdate.referenceCount, static_cast<void*>(_provider.get()));
+     *pfOk = TRUE;
+     return S_OK;
+ }
+@@ -418,6 +469,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+ STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
+ try
+ {
++    TSFLOG("OnEndComposition comps(before)={} pending={} provider={}", _compositions, _editSessionCompositionUpdate.referenceCount, static_cast<void*>(_provider.get()));
+     if (_compositions <= 0)
+     {
+         return E_FAIL;
+@@ -444,6 +496,7 @@ CATCH_RETURN()
+ STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
+ try
+ {
++    TSFLOG("OnEndEdit comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
+     if (_compositions == 1)
+     {
+         // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
+@@ -581,17 +634,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+     // Some of the sessions are async, and we don't want to send another request if one is still in flight.
+     if (session.referenceCount)
+     {
++        TSFLOG("_request skipped: previous session still pending (refs={})", session.referenceCount);
+         return S_FALSE;
+     }
+ 
+     HRESULT hr = S_OK;
+-    THROW_IF_FAILED(_context->RequestEditSession(_clientId, &session, flags, &hr));
++    const auto hrReq = _context->RequestEditSession(_clientId, &session, flags, &hr);
++    TSFLOG("_request flags={:#x} hrReq={:#x} hr={:#x} refsAfter={}", flags, static_cast<uint32_t>(hrReq), static_cast<uint32_t>(hr), session.referenceCount);
++    THROW_IF_FAILED(hrReq);
+     RETURN_IF_FAILED(hr);
+     return S_OK;
+ }
+ 
+ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+ {
++    TSFLOG("_doCompositionUpdate begin comps={}", _compositions);
+     wil::com_ptr<ITfRange> fullRange;
+     LONG fullRangeLength;
+     THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
+@@ -720,6 +777,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+         THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
+     }
+ 
++    TSFLOG("_doCompositionUpdate finalized={} active={} comps={} provider={}", finalizedString.size(), activeComposition.size(), _compositions, static_cast<void*>(_provider.get()));
+     if (_provider)
+     {
+         {
