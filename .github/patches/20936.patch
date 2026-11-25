@@ -1,8 +1,8 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..2639168 100644
+index 81322b8..621c84c 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
-@@ -12,6 +12,28 @@
+@@ -12,6 +12,39 @@
  
  using namespace Microsoft::Console::TSF;
  
@@ -28,10 +28,21 @@ index 81322b8..2639168 100644
 +}
 +#define TSFLOG(...) tsfLog(fmt::format(__VA_ARGS__))
 +
++// 0 = TSF focus is not on our document manager, 1 = it is, -1 = GetFocus failed
++static int tsfFocusIsOurs(ITfThreadMgrEx* mgr, ITfDocumentMgr* ours) noexcept
++{
++    wil::com_ptr<ITfDocumentMgr> focused;
++    if (FAILED(mgr->GetFocus(focused.addressof())))
++    {
++        return -1;
++    }
++    return focused.get() == ours ? 1 : 0;
++}
++
  static void TfSelectionClose(const TF_SELECTION* sel)
  {
      if (const auto r = sel->range)
-@@ -187,15 +209,34 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -187,15 +220,34 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
@@ -56,7 +67,7 @@ index 81322b8..2639168 100644
 +    }
 +
 +    _provider = provider;
-+    TSFLOG("Focus leave comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
++    TSFLOG("Focus leave comps={} pending={} focusOurs={} hwndFocus={}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfFocusIsOurs(_threadMgrEx.get(), _documentMgr.get()), static_cast<void*>(GetFocus()));
  }
  
  void Implementation::Unfocus(IDataProvider* provider)
@@ -68,7 +79,7 @@ index 81322b8..2639168 100644
          return;
      }
  
-@@ -221,12 +262,18 @@ void Implementation::Unfocus(IDataProvider* provider)
+@@ -221,12 +273,15 @@ void Implementation::Unfocus(IDataProvider* provider)
  
      if (_compositions > 0 && _ownerCompositionServices)
      {
@@ -81,14 +92,11 @@ index 81322b8..2639168 100644
  
  bool Implementation::HasActiveComposition() const noexcept
  {
-+    if (_compositions > 0)
-+    {
-+        TSFLOG("HasActiveComposition=true comps={} (key swallowed)", _compositions);
-+    }
++    TSFLOG("Key reached TermControl comps={} focusOurs={} hwndFocus={}", _compositions, tsfFocusIsOurs(_threadMgrEx.get(), _documentMgr.get()), static_cast<void*>(GetFocus()));
      return _compositions > 0;
  }
  
-@@ -247,7 +294,9 @@ void Implementation::FlushPendingComposition() noexcept
+@@ -247,7 +302,9 @@ void Implementation::FlushPendingComposition() noexcept
      // references the proxy. Letting that request run afterwards is harmless, because
      // _doCompositionUpdate() derives everything from the current state of the context.
      HRESULT hr = S_OK;
@@ -99,7 +107,7 @@ index 81322b8..2639168 100644
      LOG_IF_FAILED(hr);
  }
  
-@@ -405,6 +454,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+@@ -405,6 +462,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
  try
  {
      _compositions++;
@@ -107,7 +115,7 @@ index 81322b8..2639168 100644
      *pfOk = TRUE;
      return S_OK;
  }
-@@ -418,6 +468,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+@@ -418,6 +476,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
  STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
  try
  {
@@ -115,7 +123,7 @@ index 81322b8..2639168 100644
      if (_compositions <= 0)
      {
          return E_FAIL;
-@@ -444,6 +495,7 @@ CATCH_RETURN()
+@@ -444,6 +503,7 @@ CATCH_RETURN()
  STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
  try
  {
@@ -123,7 +131,7 @@ index 81322b8..2639168 100644
      if (_compositions == 1)
      {
          // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
-@@ -581,17 +633,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+@@ -581,17 +641,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
      // Some of the sessions are async, and we don't want to send another request if one is still in flight.
      if (session.referenceCount)
      {
@@ -146,7 +154,7 @@ index 81322b8..2639168 100644
      wil::com_ptr<ITfRange> fullRange;
      LONG fullRangeLength;
      THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
-@@ -720,6 +776,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+@@ -720,6 +784,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
          THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
      }
  
