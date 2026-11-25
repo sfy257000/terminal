@@ -1,0 +1,30 @@
+diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
+index 81322b8..2d3185e 100644
+--- a/src/tsf/Implementation.cpp
++++ b/src/tsf/Implementation.cpp
+@@ -187,9 +187,23 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+ 
+ void Implementation::Focus(IDataProvider* provider)
+ {
+-    _provider = provider;
+-
+     THROW_IF_FAILED(_threadMgrEx->SetFocus(_documentMgr.get()));
++
++    // GH#20936: If the window lost focus mid-composition, Unfocus()'s TerminateComposition() can fail
++    // because the thread has already lost TSF focus. Some IMEs (e.g. Microsoft Bopomofo) then abandon
++    // that composition and start a new one, leaving _compositions stuck above the real count.
++    // Since OnEndEdit() only updates at 1 and OnEndComposition() only flushes at 0, that blocks all IME input.
++    // Now that we have focus again, end the stale composition and discard its text (_provider is still null),
++    // the same way Unfocus() would have.
++    if (_compositions > 0 && _ownerCompositionServices)
++    {
++        _provider.reset();
++        std::ignore = _ownerCompositionServices->TerminateComposition(nullptr);
++        _compositions = 0;
++        FlushPendingComposition();
++    }
++
++    _provider = provider;
+ }
+ 
+ void Implementation::Unfocus(IDataProvider* provider)

@@ -1,0 +1,68 @@
+# Builds Microsoft.Terminal.Control.dll from v1.26.2734.0 + .github/patches/20936.patch, to drop into the unpackaged release
+name: Build GH-20936 fix
+on:
+  push:
+    branches: [fix/20936-bopomofo-stale-composition]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/terminal
+          ref: v1.26.2734.0
+
+      - uses: actions/checkout@v4
+        with:
+          path: _fix
+          sparse-checkout: .github/patches
+
+      - run: git apply --verbose _fix/.github/patches/20936.patch
+        name: Apply patch
+
+      - uses: nuget/setup-nuget@v2
+
+      - run: |-
+          $vsWhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $devShell = & $vsWhere -products * -latest -prerelease -find **\*DevShell.dll
+          $instance = & $vsWhere -path $devShell -property instanceId
+          Import-Module $devShell
+          Enter-VsDevShell $instance -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          & msbuild OpenConsole.slnx /p:Platform=x64 /p:Configuration=Release /p:WindowsTerminalOfficialBuild=true /clp:Verbosity=Minimal /m /t:Restore
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & nuget restore dep/nuget/packages.config
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & msbuild OpenConsole.slnx `
+            /p:Platform=x64 `
+            /p:Configuration=Release `
+            /p:WindowsTerminalOfficialBuild=true `
+            /p:WindowsTerminalBranding=Preview `
+            /p:OpenConsoleCleanPCH=true `
+            "/t:Terminal\Control\TerminalControl" `
+            /clp:Verbosity=Minimal `
+            /m `
+            /bl:msbuild.binlog
+          exit $LASTEXITCODE
+        name: Restore and build TerminalControl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Microsoft.Terminal.Control
+          path: |-
+            bin/x64/Release/**/Microsoft.Terminal.Control.dll
+            bin/x64/Release/**/Microsoft.Terminal.Control.pdb
+            bin/x64/Release/**/Microsoft.Terminal.Control.winmd
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: logs
+          path: |-
+            msbuild.binlog
+            obj/x64/vcpkg/**/*.log
