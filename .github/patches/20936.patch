@@ -1,8 +1,8 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..621c84c 100644
+index 81322b8..2d3122f 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
-@@ -12,6 +12,39 @@
+@@ -12,6 +12,68 @@
  
  using namespace Microsoft::Console::TSF;
  
@@ -28,6 +28,35 @@ index 81322b8..621c84c 100644
 +}
 +#define TSFLOG(...) tsfLog(fmt::format(__VA_ARGS__))
 +
++// GH#20936 debug: true if %TEMP%\wt-tsf-20936.mode contains the letter c
++static bool tsfMode(char c) noexcept
++try
++{
++    wchar_t buf[MAX_PATH];
++    const auto n = GetTempPathW(MAX_PATH, buf);
++    const auto path = std::wstring{ buf, n } + L"wt-tsf-20936.mode";
++    wil::unique_hfile f{ CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
++    if (!f)
++    {
++        return false;
++    }
++    char data[16]{};
++    DWORD read = 0;
++    ReadFile(f.get(), data, sizeof(data) - 1, &read, nullptr);
++    return std::string_view{ data, read }.find(c) != std::string_view::npos;
++}
++catch (...)
++{
++    return false;
++}
++
++// true if the foreground window belongs to another thread, i.e. our window was deactivated
++static bool tsfWindowDeactivated() noexcept
++{
++    const auto fg = GetForegroundWindow();
++    return !fg || GetWindowThreadProcessId(fg, nullptr) != GetCurrentThreadId();
++}
++
 +// 0 = TSF focus is not on our document manager, 1 = it is, -1 = GetFocus failed
 +static int tsfFocusIsOurs(ITfThreadMgrEx* mgr, ITfDocumentMgr* ours) noexcept
 +{
@@ -42,13 +71,27 @@ index 81322b8..621c84c 100644
  static void TfSelectionClose(const TF_SELECTION* sel)
  {
      if (const auto r = sel->range)
-@@ -187,15 +220,34 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -187,15 +249,49 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
 -    _provider = provider;
--
-+    TSFLOG("Focus enter provider={} cur={} comps={} pending={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount);
++    TSFLOG("Focus enter provider={} cur={} comps={} pending={} modeA={} modeB={} modeC={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount, tsfMode('a'), tsfMode('b'), tsfMode('c'));
++
++    // mode b: bounce TSF focus through an empty document manager so the TIP sees a document change
++    if (tsfMode('b'))
++    {
++        if (!_bounceDocumentMgr)
++        {
++            LOG_IF_FAILED(_threadMgrEx->CreateDocumentMgr(_bounceDocumentMgr.addressof()));
++        }
++        if (_bounceDocumentMgr)
++        {
++            const auto hrBounce = _threadMgrEx->SetFocus(_bounceDocumentMgr.get());
++            TSFLOG("Focus bounce hr={:#x}", static_cast<uint32_t>(hrBounce));
++        }
++    }
+ 
      THROW_IF_FAILED(_threadMgrEx->SetFocus(_documentMgr.get()));
 +
 +    // GH#20936: If the window lost focus mid-composition, Unfocus()'s TerminateComposition() can fail
@@ -57,7 +100,7 @@ index 81322b8..621c84c 100644
 +    // Since OnEndEdit() only updates at 1 and OnEndComposition() only flushes at 0, that blocks all IME input.
 +    // Now that we have focus again, end the stale composition and discard its text (_provider is still null),
 +    // the same way Unfocus() would have.
-+    if (_compositions > 0 && _ownerCompositionServices)
++    if (tsfMode('c') && _compositions > 0 && _ownerCompositionServices)
 +    {
 +        _provider.reset();
 +        const auto hrTerm = _ownerCompositionServices->TerminateComposition(nullptr);
@@ -72,16 +115,24 @@ index 81322b8..621c84c 100644
  
  void Implementation::Unfocus(IDataProvider* provider)
  {
-+    TSFLOG("Unfocus enter provider={} cur={} comps={} pending={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount);
++    TSFLOG("Unfocus enter provider={} cur={} comps={} pending={} hwndFocus={} active={} fg={} deactivated={}", static_cast<void*>(provider), static_cast<void*>(_provider.get()), _compositions, _editSessionCompositionUpdate.referenceCount, static_cast<void*>(GetFocus()), static_cast<void*>(GetActiveWindow()), static_cast<void*>(GetForegroundWindow()), tsfWindowDeactivated());
      if (!_provider || _provider != provider)
      {
 +        TSFLOG("Unfocus skipped (provider mismatch)");
          return;
      }
  
-@@ -221,12 +273,15 @@ void Implementation::Unfocus(IDataProvider* provider)
+@@ -219,14 +315,22 @@ void Implementation::Unfocus(IDataProvider* provider)
  
-     if (_compositions > 0 && _ownerCompositionServices)
+     _provider.reset();
+ 
+-    if (_compositions > 0 && _ownerCompositionServices)
++    // mode a: if the whole window was deactivated, leave the composition to the IME
++    if (tsfMode('a') && tsfWindowDeactivated())
++    {
++        TSFLOG("Unfocus window deactivated, composition left to the IME");
++    }
++    else if (_compositions > 0 && _ownerCompositionServices)
      {
 -        std::ignore = _ownerCompositionServices->TerminateComposition(nullptr);
 +        const auto hrTerm = _ownerCompositionServices->TerminateComposition(nullptr);
@@ -96,7 +147,7 @@ index 81322b8..621c84c 100644
      return _compositions > 0;
  }
  
-@@ -247,7 +302,9 @@ void Implementation::FlushPendingComposition() noexcept
+@@ -247,7 +351,9 @@ void Implementation::FlushPendingComposition() noexcept
      // references the proxy. Letting that request run afterwards is harmless, because
      // _doCompositionUpdate() derives everything from the current state of the context.
      HRESULT hr = S_OK;
@@ -107,7 +158,7 @@ index 81322b8..621c84c 100644
      LOG_IF_FAILED(hr);
  }
  
-@@ -405,6 +462,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+@@ -405,6 +511,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
  try
  {
      _compositions++;
@@ -115,7 +166,7 @@ index 81322b8..621c84c 100644
      *pfOk = TRUE;
      return S_OK;
  }
-@@ -418,6 +476,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+@@ -418,6 +525,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
  STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
  try
  {
@@ -123,7 +174,7 @@ index 81322b8..621c84c 100644
      if (_compositions <= 0)
      {
          return E_FAIL;
-@@ -444,6 +503,7 @@ CATCH_RETURN()
+@@ -444,6 +552,7 @@ CATCH_RETURN()
  STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
  try
  {
@@ -131,7 +182,7 @@ index 81322b8..621c84c 100644
      if (_compositions == 1)
      {
          // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
-@@ -581,17 +641,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+@@ -581,17 +690,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
      // Some of the sessions are async, and we don't want to send another request if one is still in flight.
      if (session.referenceCount)
      {
@@ -154,7 +205,7 @@ index 81322b8..621c84c 100644
      wil::com_ptr<ITfRange> fullRange;
      LONG fullRangeLength;
      THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
-@@ -720,6 +784,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+@@ -720,6 +833,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
          THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
      }
  
@@ -162,3 +213,15 @@ index 81322b8..621c84c 100644
      if (_provider)
      {
          {
+diff --git a/src/tsf/Implementation.h b/src/tsf/Implementation.h
+index 5c55624..21ea353 100644
+--- a/src/tsf/Implementation.h
++++ b/src/tsf/Implementation.h
+@@ -120,6 +120,7 @@ namespace Microsoft::Console::TSF
+         wil::com_ptr<ITfDisplayAttributeMgr> _displayAttributeMgr;
+         wil::com_ptr<ITfThreadMgrEx> _threadMgrEx;
+         wil::com_ptr<ITfDocumentMgr> _documentMgr;
++        wil::com_ptr<ITfDocumentMgr> _bounceDocumentMgr;
+         wil::com_ptr<ITfContext> _context;
+         wil::com_ptr<ITfContextOwnerCompositionServices> _ownerCompositionServices;
+         wil::com_ptr<ITfSource> _contextSource;
