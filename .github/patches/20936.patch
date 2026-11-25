@@ -1,5 +1,5 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..5b83ae9 100644
+index 81322b8..fdee201 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
 @@ -7,11 +7,102 @@
@@ -105,7 +105,7 @@ index 81322b8..5b83ae9 100644
  static void TfSelectionClose(const TF_SELECTION* sel)
  {
      if (const auto r = sel->range)
-@@ -187,15 +278,74 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -187,15 +278,91 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
@@ -122,6 +122,23 @@ index 81322b8..5b83ae9 100644
 +        {
 +            const auto hrBounce = _threadMgrEx->SetFocus(_bounceDocumentMgr.get());
 +            TSFLOG("Focus bounce hr={:#x}", static_cast<uint32_t>(hrBounce));
++        }
++    }
++
++    // mode h: associate our document with the input HWND, so TSF restores focus itself when the window is reactivated
++    if (tsfMode('h'))
++    {
++        const auto hwnd = provider->GetHwnd();
++        if (hwnd && hwnd != _associatedHwnd)
++        {
++            wil::com_ptr<ITfDocumentMgr> prev;
++            const auto hrAssoc = _threadMgrEx->AssociateFocus(hwnd, _documentMgr.get(), prev.addressof());
++            TSFLOG("Focus mode h AssociateFocus hwnd={} hr={:#x} prev={}", static_cast<void*>(hwnd), static_cast<uint32_t>(hrAssoc), static_cast<void*>(prev.get()));
++            if (SUCCEEDED(hrAssoc))
++            {
++                _associatedHwnd = hwnd;
++                _prevAssociatedDocumentMgr = std::move(prev);
++            }
 +        }
 +    }
 +
@@ -181,7 +198,7 @@ index 81322b8..5b83ae9 100644
          return;
      }
  
-@@ -217,16 +367,34 @@ void Implementation::Unfocus(IDataProvider* provider)
+@@ -217,16 +384,44 @@ void Implementation::Unfocus(IDataProvider* provider)
          }
      }
  
@@ -198,6 +215,16 @@ index 81322b8..5b83ae9 100644
      _provider.reset();
  
 -    if (_compositions > 0 && _ownerCompositionServices)
++    // mode h: give the HWND back to its previous document when focus moves elsewhere inside the window
++    if (tsfMode('h') && _associatedHwnd && !tsfWindowDeactivated())
++    {
++        wil::com_ptr<ITfDocumentMgr> prev;
++        const auto hrAssoc = _threadMgrEx->AssociateFocus(_associatedHwnd, _prevAssociatedDocumentMgr.get(), prev.addressof());
++        TSFLOG("Unfocus mode h restore association hwnd={} hr={:#x}", static_cast<void*>(_associatedHwnd), static_cast<uint32_t>(hrAssoc));
++        _associatedHwnd = nullptr;
++        _prevAssociatedDocumentMgr.reset();
++    }
++
 +    // mode a: if the whole window was deactivated, leave the composition to the IME
 +    if (tsfMode('a') && tsfWindowDeactivated())
 +    {
@@ -218,7 +245,7 @@ index 81322b8..5b83ae9 100644
      return _compositions > 0;
  }
  
-@@ -247,7 +415,9 @@ void Implementation::FlushPendingComposition() noexcept
+@@ -247,7 +442,9 @@ void Implementation::FlushPendingComposition() noexcept
      // references the proxy. Letting that request run afterwards is harmless, because
      // _doCompositionUpdate() derives everything from the current state of the context.
      HRESULT hr = S_OK;
@@ -229,7 +256,7 @@ index 81322b8..5b83ae9 100644
      LOG_IF_FAILED(hr);
  }
  
-@@ -405,6 +575,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+@@ -405,6 +602,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
  try
  {
      _compositions++;
@@ -237,7 +264,7 @@ index 81322b8..5b83ae9 100644
      *pfOk = TRUE;
      return S_OK;
  }
-@@ -418,6 +589,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+@@ -418,6 +616,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
  STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
  try
  {
@@ -245,7 +272,7 @@ index 81322b8..5b83ae9 100644
      if (_compositions <= 0)
      {
          return E_FAIL;
-@@ -444,6 +616,7 @@ CATCH_RETURN()
+@@ -444,6 +643,7 @@ CATCH_RETURN()
  STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
  try
  {
@@ -253,7 +280,7 @@ index 81322b8..5b83ae9 100644
      if (_compositions == 1)
      {
          // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
-@@ -581,17 +754,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+@@ -581,17 +781,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
      // Some of the sessions are async, and we don't want to send another request if one is still in flight.
      if (session.referenceCount)
      {
@@ -276,7 +303,7 @@ index 81322b8..5b83ae9 100644
      wil::com_ptr<ITfRange> fullRange;
      LONG fullRangeLength;
      THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
-@@ -720,6 +897,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+@@ -720,6 +924,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
          THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
      }
  
@@ -285,14 +312,15 @@ index 81322b8..5b83ae9 100644
      {
          {
 diff --git a/src/tsf/Implementation.h b/src/tsf/Implementation.h
-index 5c55624..21ea353 100644
+index 5c55624..e24bd6b 100644
 --- a/src/tsf/Implementation.h
 +++ b/src/tsf/Implementation.h
-@@ -120,6 +120,7 @@ namespace Microsoft::Console::TSF
+@@ -120,6 +120,8 @@ namespace Microsoft::Console::TSF
          wil::com_ptr<ITfDisplayAttributeMgr> _displayAttributeMgr;
          wil::com_ptr<ITfThreadMgrEx> _threadMgrEx;
          wil::com_ptr<ITfDocumentMgr> _documentMgr;
 +        wil::com_ptr<ITfDocumentMgr> _bounceDocumentMgr;
++        wil::com_ptr<ITfDocumentMgr> _prevAssociatedDocumentMgr;
          wil::com_ptr<ITfContext> _context;
          wil::com_ptr<ITfContextOwnerCompositionServices> _ownerCompositionServices;
          wil::com_ptr<ITfSource> _contextSource;
