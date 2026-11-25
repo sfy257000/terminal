@@ -1,8 +1,8 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..ec17301 100644
+index 81322b8..bbcdef0 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
-@@ -12,6 +12,68 @@
+@@ -12,6 +12,96 @@
  
  using namespace Microsoft::Console::TSF;
  
@@ -57,6 +57,34 @@ index 81322b8..ec17301 100644
 +    return !fg || GetWindowThreadProcessId(fg, nullptr) != GetCurrentThreadId();
 +}
 +
++// mode g: ask the IME to complete its composition via IMM (imm32 is loaded dynamically, TerminalControl doesn't link it)
++static BOOL tsfImmComplete(HWND hwnd) noexcept
++{
++    static const auto imm = LoadLibraryExW(L"imm32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (!imm)
++    {
++        return FALSE;
++    }
++    using GetContext = HIMC(WINAPI*)(HWND);
++    using NotifyIME = BOOL(WINAPI*)(HIMC, DWORD, DWORD, DWORD);
++    using ReleaseContext = BOOL(WINAPI*)(HWND, HIMC);
++    const auto getContext = reinterpret_cast<GetContext>(GetProcAddress(imm, "ImmGetContext"));
++    const auto notifyIME = reinterpret_cast<NotifyIME>(GetProcAddress(imm, "ImmNotifyIME"));
++    const auto releaseContext = reinterpret_cast<ReleaseContext>(GetProcAddress(imm, "ImmReleaseContext"));
++    if (!getContext || !notifyIME || !releaseContext)
++    {
++        return FALSE;
++    }
++    const auto himc = getContext(hwnd);
++    if (!himc)
++    {
++        return FALSE;
++    }
++    const auto ok = notifyIME(himc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
++    releaseContext(hwnd, himc);
++    return ok;
++}
++
 +// 0 = TSF focus is not on our document manager, 1 = it is, -1 = GetFocus failed
 +static int tsfFocusIsOurs(ITfThreadMgrEx* mgr, ITfDocumentMgr* ours) noexcept
 +{
@@ -71,7 +99,7 @@ index 81322b8..ec17301 100644
  static void TfSelectionClose(const TF_SELECTION* sel)
  {
      if (const auto r = sel->range)
-@@ -187,15 +249,74 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -187,15 +277,74 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
@@ -147,8 +175,20 @@ index 81322b8..ec17301 100644
          return;
      }
  
-@@ -219,14 +340,22 @@ void Implementation::Unfocus(IDataProvider* provider)
+@@ -217,16 +366,34 @@ void Implementation::Unfocus(IDataProvider* provider)
+         }
+     }
  
++    // mode g: let the IME complete the composition itself while we can still send the text
++    if (tsfMode('g') && _compositions > 0 && tsfWindowDeactivated())
++    {
++        const auto hwnd = _provider->GetHwnd();
++        const auto ok = tsfImmComplete(hwnd);
++        TSFLOG("Unfocus mode g ImmNotifyIME(CPS_COMPLETE) hwnd={} ok={} comps={} pending={}", static_cast<void*>(hwnd), ok, _compositions, _editSessionCompositionUpdate.referenceCount);
++        FlushPendingComposition();
++        TSFLOG("Unfocus mode g after flush comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
++    }
++
      _provider.reset();
  
 -    if (_compositions > 0 && _ownerCompositionServices)
@@ -172,7 +212,7 @@ index 81322b8..ec17301 100644
      return _compositions > 0;
  }
  
-@@ -247,7 +376,9 @@ void Implementation::FlushPendingComposition() noexcept
+@@ -247,7 +414,9 @@ void Implementation::FlushPendingComposition() noexcept
      // references the proxy. Letting that request run afterwards is harmless, because
      // _doCompositionUpdate() derives everything from the current state of the context.
      HRESULT hr = S_OK;
@@ -183,7 +223,7 @@ index 81322b8..ec17301 100644
      LOG_IF_FAILED(hr);
  }
  
-@@ -405,6 +536,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+@@ -405,6 +574,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
  try
  {
      _compositions++;
@@ -191,7 +231,7 @@ index 81322b8..ec17301 100644
      *pfOk = TRUE;
      return S_OK;
  }
-@@ -418,6 +550,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+@@ -418,6 +588,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
  STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
  try
  {
@@ -199,7 +239,7 @@ index 81322b8..ec17301 100644
      if (_compositions <= 0)
      {
          return E_FAIL;
-@@ -444,6 +577,7 @@ CATCH_RETURN()
+@@ -444,6 +615,7 @@ CATCH_RETURN()
  STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
  try
  {
@@ -207,7 +247,7 @@ index 81322b8..ec17301 100644
      if (_compositions == 1)
      {
          // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
-@@ -581,17 +715,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+@@ -581,17 +753,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
      // Some of the sessions are async, and we don't want to send another request if one is still in flight.
      if (session.referenceCount)
      {
@@ -230,7 +270,7 @@ index 81322b8..ec17301 100644
      wil::com_ptr<ITfRange> fullRange;
      LONG fullRangeLength;
      THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
-@@ -720,6 +858,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+@@ -720,6 +896,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
          THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
      }
  
