@@ -1,5 +1,5 @@
 diff --git a/src/tsf/Implementation.cpp b/src/tsf/Implementation.cpp
-index 81322b8..fdee201 100644
+index 81322b8..4a74c13 100644
 --- a/src/tsf/Implementation.cpp
 +++ b/src/tsf/Implementation.cpp
 @@ -7,11 +7,102 @@
@@ -105,7 +105,23 @@ index 81322b8..fdee201 100644
  static void TfSelectionClose(const TF_SELECTION* sel)
  {
      if (const auto r = sel->range)
-@@ -187,15 +278,91 @@ void Implementation::AssociateFocus(IDataProvider* provider)
+@@ -84,7 +175,14 @@ HRESULT Implementation::Initialize()
+     // There's no point in calling TF_GetThreadMgr. ITfThreadMgr is a per-thread singleton.
+     RETURN_IF_FAILED_EXPECTED(CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(_threadMgrEx.addressof())));
+ 
+-    RETURN_IF_FAILED(_threadMgrEx->ActivateEx(&_clientId, s_activationFlags.load(std::memory_order_relaxed)));
++    // mode k: activate without TF_TMAE_CONSOLE
++    auto activationFlags = s_activationFlags.load(std::memory_order_relaxed);
++    if (tsfMode('k'))
++    {
++        activationFlags &= ~static_cast<DWORD>(TF_TMAE_CONSOLE);
++    }
++    TSFLOG("Initialize ActivateEx flags={:#x}", activationFlags);
++    RETURN_IF_FAILED(_threadMgrEx->ActivateEx(&_clientId, activationFlags));
+     RETURN_IF_FAILED(_threadMgrEx->CreateDocumentMgr(_documentMgr.addressof()));
+ 
+     TfEditCookie ecTextStore;
+@@ -187,15 +285,91 @@ void Implementation::AssociateFocus(IDataProvider* provider)
  
  void Implementation::Focus(IDataProvider* provider)
  {
@@ -198,7 +214,7 @@ index 81322b8..fdee201 100644
          return;
      }
  
-@@ -217,16 +384,44 @@ void Implementation::Unfocus(IDataProvider* provider)
+@@ -217,16 +391,44 @@ void Implementation::Unfocus(IDataProvider* provider)
          }
      }
  
@@ -245,7 +261,7 @@ index 81322b8..fdee201 100644
      return _compositions > 0;
  }
  
-@@ -247,7 +442,9 @@ void Implementation::FlushPendingComposition() noexcept
+@@ -247,7 +449,9 @@ void Implementation::FlushPendingComposition() noexcept
      // references the proxy. Letting that request run afterwards is harmless, because
      // _doCompositionUpdate() derives everything from the current state of the context.
      HRESULT hr = S_OK;
@@ -256,7 +272,18 @@ index 81322b8..fdee201 100644
      LOG_IF_FAILED(hr);
  }
  
-@@ -405,6 +602,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
+@@ -371,7 +575,9 @@ STDMETHODIMP Implementation::GetStatus(TF_STATUS* pdcs) noexcept
+         // It's not publicly documented, but allegedly specifying this flag results in a minor performance uplift.
+         // Ironically, the only two places that mention this flag internally state:
+         // > perf: we could check TS_SS_NOHIDDENTEXT for better perf
+-        pdcs->dwStaticFlags = TS_SS_TRANSITORY | TS_SS_NOHIDDENTEXT;
++        // mode l: don't mark the document as transitory
++        pdcs->dwStaticFlags = tsfMode('l') ? TS_SS_NOHIDDENTEXT : TS_SS_TRANSITORY | TS_SS_NOHIDDENTEXT;
++        TSFLOG("GetStatus staticFlags={:#x}", pdcs->dwStaticFlags);
+     }
+ 
+     return S_OK;
+@@ -405,6 +611,7 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
  try
  {
      _compositions++;
@@ -264,7 +291,7 @@ index 81322b8..fdee201 100644
      *pfOk = TRUE;
      return S_OK;
  }
-@@ -418,6 +616,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
+@@ -418,6 +625,7 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
  STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
  try
  {
@@ -272,7 +299,7 @@ index 81322b8..fdee201 100644
      if (_compositions <= 0)
      {
          return E_FAIL;
-@@ -444,6 +643,7 @@ CATCH_RETURN()
+@@ -444,6 +652,7 @@ CATCH_RETURN()
  STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
  try
  {
@@ -280,7 +307,7 @@ index 81322b8..fdee201 100644
      if (_compositions == 1)
      {
          // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
-@@ -581,17 +781,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
+@@ -581,17 +790,21 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
      // Some of the sessions are async, and we don't want to send another request if one is still in flight.
      if (session.referenceCount)
      {
@@ -303,7 +330,7 @@ index 81322b8..fdee201 100644
      wil::com_ptr<ITfRange> fullRange;
      LONG fullRangeLength;
      THROW_IF_FAILED(_context->GetStart(ec, fullRange.addressof()));
-@@ -720,6 +924,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
+@@ -720,6 +933,7 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
          THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
      }
  
