@@ -308,19 +308,6 @@ void Implementation::Focus(IDataProvider* provider)
 
     THROW_IF_FAILED(_threadMgrEx->SetFocus(_documentMgr.get()));
     TSFLOG("Focus after SetFocus comps={} pending={} open={} conv={:#x}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose), tsfCompartmentGet(_threadMgrEx.get(), tsfConversion));
-
-    if (_leftComposition)
-    {
-        _leftComposition = false;
-        if (tsfMode('w'))
-        {
-            RunReactivateFix();
-        }
-        else
-        {
-            SetTimer(nullptr, 0, 100, tsfReactivateTimer);
-        }
-    }
 }
 
 // GH#20936 test build: candidate fixes for the first key lost after reactivation, selected by letter
@@ -674,7 +661,19 @@ STDMETHODIMP Implementation::OnKeyTraceUp(WPARAM wParam, LPARAM lParam) noexcept
 
 STDMETHODIMP Implementation::OnSetThreadFocus() noexcept
 {
-    TSFLOG("OnSetThreadFocus comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
+    TSFLOG("OnSetThreadFocus comps={} pending={} left={}", _compositions, _editSessionCompositionUpdate.referenceCount, _leftComposition);
+    if (_leftComposition)
+    {
+        _leftComposition = false;
+        if (tsfMode('w'))
+        {
+            RunReactivateFix();
+        }
+        else
+        {
+            SetTimer(nullptr, 0, 50, tsfReactivateTimer);
+        }
+    }
     return S_OK;
 }
 
