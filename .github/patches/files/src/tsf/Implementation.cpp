@@ -357,6 +357,24 @@ try
         TSFLOG("ReactivateFix u refocus hr0={:#x} hr1={:#x}", static_cast<uint32_t>(hr0), static_cast<uint32_t>(hr1));
     }
 
+    if (tsfMode('q'))
+    {
+        if (const auto keystrokeMgr = _threadMgrEx.try_query<ITfKeystrokeMgr>())
+        {
+            BOOL eatenDown = FALSE;
+            BOOL eatenUp = FALSE;
+            const auto hr0 = keystrokeMgr->KeyDown('C', 0x002e0001, &eatenDown);
+            const auto hr1 = keystrokeMgr->KeyUp('C', 0xC02e0001, &eatenUp);
+            TSFLOG("ReactivateFix q key C hr0={:#x} eaten={} hr1={:#x} eaten={} comps={}", static_cast<uint32_t>(hr0), eatenDown, static_cast<uint32_t>(hr1), eatenUp, _compositions);
+            if (_compositions > 0)
+            {
+                const auto hr2 = keystrokeMgr->KeyDown(VK_ESCAPE, 0x00010001, &eatenDown);
+                const auto hr3 = keystrokeMgr->KeyUp(VK_ESCAPE, 0xC0010001, &eatenUp);
+                TSFLOG("ReactivateFix q escape hr2={:#x} eaten={} hr3={:#x} eaten={} comps={}", static_cast<uint32_t>(hr2), eatenDown, static_cast<uint32_t>(hr3), eatenUp, _compositions);
+            }
+        }
+    }
+
     TSFLOG("ReactivateFix end comps={} pending={} open={} conv={:#x}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose), tsfCompartmentGet(_threadMgrEx.get(), tsfConversion));
 }
 CATCH_LOG()
