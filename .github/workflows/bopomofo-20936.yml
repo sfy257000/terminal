@@ -2,7 +2,7 @@
 name: Build GH-20936 fix
 on:
   push:
-    branches: [fix/20936-bopomofo-stale-composition]
+    branches: [fix/20936-bopomofo-stale-composition, test/20936-first-key]
   workflow_dispatch:
 
 permissions:
