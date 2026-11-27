@@ -14,7 +14,7 @@ namespace Microsoft::Console::TSF
 {
     struct IDataProvider;
 
-    struct Implementation : ITfContextOwner, ITfContextOwnerCompositionSink, ITfTextEditSink, ITfKeyTraceEventSink, ITfThreadFocusSink
+    struct Implementation : ITfContextOwner, ITfContextOwnerCompositionSink, ITfTextEditSink, ITfThreadFocusSink
     {
         static void AvoidBuggyTSFConsoleFlags() noexcept;
         static void SetDefaultScopeAlphanumericHalfWidth(bool enable) noexcept;
@@ -51,15 +51,9 @@ namespace Microsoft::Console::TSF
         // ITfTextEditSink methods
         STDMETHODIMP OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept override;
 
-        // ITfKeyTraceEventSink methods
-        STDMETHODIMP OnKeyTraceDown(WPARAM wParam, LPARAM lParam) noexcept override;
-        STDMETHODIMP OnKeyTraceUp(WPARAM wParam, LPARAM lParam) noexcept override;
-
         // ITfThreadFocusSink methods
         STDMETHODIMP OnSetThreadFocus() noexcept override;
         STDMETHODIMP OnKillThreadFocus() noexcept override;
-
-        void RunReactivateFix() noexcept;
 
     private:
         struct EditSessionProxyBase : ITfEditSession
@@ -135,14 +129,12 @@ namespace Microsoft::Console::TSF
         wil::com_ptr<ITfSource> _contextSource;
         DWORD _cookieContextOwner = TF_INVALID_COOKIE;
         DWORD _cookieTextEditSink = TF_INVALID_COOKIE;
-        wil::com_ptr<ITfSource> _threadMgrSource;
-        DWORD _cookieKeyTrace = TF_INVALID_COOKIE;
-        DWORD _cookieThreadFocus = TF_INVALID_COOKIE;
-        bool _leftComposition = false;
+        DWORD _cookieThreadFocusSink = TF_INVALID_COOKIE;
         TfClientId _clientId = TF_CLIENTID_NULL;
 
         EditSessionProxy<&Implementation::_doCompositionUpdate> _editSessionCompositionUpdate{ this };
         int _compositions = 0;
+        bool _refocusOnThreadFocus = false;
 
         AnsiInputScope _ansiInputScope{ this };
     };

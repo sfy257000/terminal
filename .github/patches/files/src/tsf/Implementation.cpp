@@ -12,98 +12,6 @@
 
 using namespace Microsoft::Console::TSF;
 
-// GH#20936 test build: append one line per TSF event to %TEMP%\wt-tsf-20936.log
-static void tsfLog(const std::string& msg) noexcept
-try
-{
-    static const auto path = [] {
-        wchar_t buf[MAX_PATH];
-        const auto n = GetTempPathW(MAX_PATH, buf);
-        return std::wstring{ buf, n } + L"wt-tsf-20936.log";
-    }();
-    const auto line = fmt::format("{} {}\r\n", GetTickCount64(), msg);
-    wil::unique_hfile f{ CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
-    if (f)
-    {
-        DWORD written;
-        WriteFile(f.get(), line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
-    }
-}
-catch (...)
-{
-}
-#define TSFLOG(...) tsfLog(fmt::format(__VA_ARGS__))
-
-// GH#20936 test build: true if %TEMP%\wt-tsf-20936.mode contains the letter c
-static bool tsfMode(char c) noexcept
-try
-{
-    wchar_t buf[MAX_PATH];
-    const auto n = GetTempPathW(MAX_PATH, buf);
-    const auto path = std::wstring{ buf, n } + L"wt-tsf-20936.mode";
-    wil::unique_hfile f{ CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
-    if (!f)
-    {
-        return false;
-    }
-    char data[32]{};
-    DWORD read = 0;
-    ReadFile(f.get(), data, sizeof(data) - 1, &read, nullptr);
-    return std::string_view{ data, read }.find(c) != std::string_view::npos;
-}
-catch (...)
-{
-    return false;
-}
-
-static constexpr GUID tsfOpenClose{ 0x58273aad, 0x01bb, 0x4164, { 0x95, 0xc6, 0x75, 0x5b, 0xa0, 0xb5, 0x16, 0x2d } };
-static constexpr GUID tsfConversion{ 0xccf05dd8, 0x4a87, 0x11d7, { 0xa6, 0xe2, 0x00, 0x06, 0x5b, 0x84, 0x43, 0x5c } };
-
-// value of a thread manager compartment, -1 if unavailable
-static long tsfCompartmentGet(ITfThreadMgrEx* mgr, const GUID& guid) noexcept
-{
-    const auto compartmentMgr = wil::try_com_query_nothrow<ITfCompartmentMgr>(mgr);
-    wil::com_ptr<ITfCompartment> compartment;
-    if (!compartmentMgr || FAILED(compartmentMgr->GetCompartment(guid, compartment.addressof())))
-    {
-        return -1;
-    }
-    VARIANT v{};
-    if (FAILED(compartment->GetValue(&v)))
-    {
-        return -1;
-    }
-    const auto value = v.vt == VT_I4 ? v.lVal : -1;
-    VariantClear(&v);
-    return value;
-}
-
-static HRESULT tsfCompartmentSet(ITfThreadMgrEx* mgr, TfClientId clientId, const GUID& guid, long value) noexcept
-{
-    const auto compartmentMgr = wil::try_com_query_nothrow<ITfCompartmentMgr>(mgr);
-    wil::com_ptr<ITfCompartment> compartment;
-    if (!compartmentMgr)
-    {
-        return E_NOINTERFACE;
-    }
-    RETURN_IF_FAILED(compartmentMgr->GetCompartment(guid, compartment.addressof()));
-    VARIANT v{};
-    v.vt = VT_I4;
-    v.lVal = value;
-    return compartment->SetValue(clientId, &v);
-}
-
-static Implementation* s_reactivateTarget = nullptr;
-
-static VOID CALLBACK tsfReactivateTimer(HWND, UINT, UINT_PTR id, DWORD) noexcept
-{
-    KillTimer(nullptr, id);
-    if (s_reactivateTarget)
-    {
-        s_reactivateTarget->RunReactivateFix();
-    }
-}
-
 static void TfSelectionClose(const TF_SELECTION* sel)
 {
     if (const auto r = sel->range)
@@ -176,13 +84,7 @@ HRESULT Implementation::Initialize()
     // There's no point in calling TF_GetThreadMgr. ITfThreadMgr is a per-thread singleton.
     RETURN_IF_FAILED_EXPECTED(CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(_threadMgrEx.addressof())));
 
-    auto activationFlags = s_activationFlags.load(std::memory_order_relaxed);
-    if (tsfMode('k'))
-    {
-        activationFlags &= ~static_cast<DWORD>(TF_TMAE_CONSOLE);
-    }
-    TSFLOG("Initialize ActivateEx flags={:#x}", activationFlags);
-    RETURN_IF_FAILED(_threadMgrEx->ActivateEx(&_clientId, activationFlags));
+    RETURN_IF_FAILED(_threadMgrEx->ActivateEx(&_clientId, s_activationFlags.load(std::memory_order_relaxed)));
     RETURN_IF_FAILED(_threadMgrEx->CreateDocumentMgr(_documentMgr.addressof()));
 
     TfEditCookie ecTextStore;
@@ -196,29 +98,13 @@ HRESULT Implementation::Initialize()
 
     RETURN_IF_FAILED(_documentMgr->Push(_context.get()));
 
-    _threadMgrSource = _threadMgrEx.try_query<ITfSource>();
-    if (_threadMgrSource)
-    {
-        LOG_IF_FAILED(_threadMgrSource->AdviseSink(__uuidof(ITfKeyTraceEventSink), static_cast<ITfKeyTraceEventSink*>(this), &_cookieKeyTrace));
-        LOG_IF_FAILED(_threadMgrSource->AdviseSink(__uuidof(ITfThreadFocusSink), static_cast<ITfThreadFocusSink*>(this), &_cookieThreadFocus));
-    }
-    s_reactivateTarget = this;
+    RETURN_IF_FAILED(_threadMgrEx.query<ITfSource>()->AdviseSink(IID_ITfThreadFocusSink, static_cast<ITfThreadFocusSink*>(this), &_cookieThreadFocusSink));
     return S_OK;
 }
 
 void Implementation::Uninitialize() noexcept
 {
     _provider.reset();
-    s_reactivateTarget = nullptr;
-
-    if (_threadMgrSource && _cookieKeyTrace != TF_INVALID_COOKIE)
-    {
-        std::ignore = _threadMgrSource->UnadviseSink(_cookieKeyTrace);
-    }
-    if (_threadMgrSource && _cookieThreadFocus != TF_INVALID_COOKIE)
-    {
-        std::ignore = _threadMgrSource->UnadviseSink(_cookieThreadFocus);
-    }
 
     if (_associatedHwnd)
     {
@@ -226,6 +112,10 @@ void Implementation::Uninitialize() noexcept
         std::ignore = _threadMgrEx->AssociateFocus(_associatedHwnd, nullptr, prev.addressof());
     }
 
+    if (_cookieThreadFocusSink != TF_INVALID_COOKIE)
+    {
+        std::ignore = _threadMgrEx.query<ITfSource>()->UnadviseSink(_cookieThreadFocusSink);
+    }
     if (_cookieTextEditSink != TF_INVALID_COOKIE)
     {
         std::ignore = _contextSource->UnadviseSink(_cookieTextEditSink);
@@ -303,85 +193,13 @@ void Implementation::AssociateFocus(IDataProvider* provider)
 
 void Implementation::Focus(IDataProvider* provider)
 {
-    TSFLOG("Focus enter comps={} pending={} left={}", _compositions, _editSessionCompositionUpdate.referenceCount, _leftComposition);
     _provider = provider;
 
     THROW_IF_FAILED(_threadMgrEx->SetFocus(_documentMgr.get()));
-    TSFLOG("Focus after SetFocus comps={} pending={} open={} conv={:#x}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose), tsfCompartmentGet(_threadMgrEx.get(), tsfConversion));
 }
-
-// GH#20936 test build: candidate fixes for the first key lost after reactivation, selected by letter
-void Implementation::RunReactivateFix() noexcept
-try
-{
-    TSFLOG("ReactivateFix begin comps={} pending={} open={} conv={:#x}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose), tsfCompartmentGet(_threadMgrEx.get(), tsfConversion));
-
-    if (tsfMode('m'))
-    {
-        const auto open = tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose);
-        if (open > 0)
-        {
-            const auto hr0 = tsfCompartmentSet(_threadMgrEx.get(), _clientId, tsfOpenClose, 0);
-            const auto hr1 = tsfCompartmentSet(_threadMgrEx.get(), _clientId, tsfOpenClose, open);
-            TSFLOG("ReactivateFix m openclose toggle hr0={:#x} hr1={:#x}", static_cast<uint32_t>(hr0), static_cast<uint32_t>(hr1));
-        }
-    }
-
-    if (tsfMode('n'))
-    {
-        const auto conv = tsfCompartmentGet(_threadMgrEx.get(), tsfConversion);
-        if (conv >= 0)
-        {
-            const auto hr0 = tsfCompartmentSet(_threadMgrEx.get(), _clientId, tsfConversion, conv ^ TF_CONVERSIONMODE_NATIVE);
-            const auto hr1 = tsfCompartmentSet(_threadMgrEx.get(), _clientId, tsfConversion, conv);
-            TSFLOG("ReactivateFix n conversion toggle hr0={:#x} hr1={:#x}", static_cast<uint32_t>(hr0), static_cast<uint32_t>(hr1));
-        }
-    }
-
-    if (tsfMode('p'))
-    {
-        if (const auto keystrokeMgr = _threadMgrEx.try_query<ITfKeystrokeMgr>())
-        {
-            BOOL eatenDown = FALSE;
-            BOOL eatenUp = FALSE;
-            const auto hr0 = keystrokeMgr->KeyDown(VK_ESCAPE, 0x00010001, &eatenDown);
-            const auto hr1 = keystrokeMgr->KeyUp(VK_ESCAPE, 0xC0010001, &eatenUp);
-            TSFLOG("ReactivateFix p escape hr0={:#x} eaten={} hr1={:#x} eaten={}", static_cast<uint32_t>(hr0), eatenDown, static_cast<uint32_t>(hr1), eatenUp);
-        }
-    }
-
-    if (tsfMode('u'))
-    {
-        const auto hr0 = _threadMgrEx->SetFocus(nullptr);
-        const auto hr1 = _threadMgrEx->SetFocus(_documentMgr.get());
-        TSFLOG("ReactivateFix u refocus hr0={:#x} hr1={:#x}", static_cast<uint32_t>(hr0), static_cast<uint32_t>(hr1));
-    }
-
-    if (tsfMode('q'))
-    {
-        if (const auto keystrokeMgr = _threadMgrEx.try_query<ITfKeystrokeMgr>())
-        {
-            BOOL eatenDown = FALSE;
-            BOOL eatenUp = FALSE;
-            const auto hr0 = keystrokeMgr->KeyDown('C', 0x002e0001, &eatenDown);
-            const auto hr1 = keystrokeMgr->KeyUp('C', 0xC02e0001, &eatenUp);
-            TSFLOG("ReactivateFix q key C hr0={:#x} eaten={} hr1={:#x} eaten={} comps={}", static_cast<uint32_t>(hr0), eatenDown, static_cast<uint32_t>(hr1), eatenUp, _compositions);
-            if (_compositions > 0)
-            {
-                const auto hr2 = keystrokeMgr->KeyDown(VK_ESCAPE, 0x00010001, &eatenDown);
-                const auto hr3 = keystrokeMgr->KeyUp(VK_ESCAPE, 0xC0010001, &eatenUp);
-                TSFLOG("ReactivateFix q escape hr2={:#x} eaten={} hr3={:#x} eaten={} comps={}", static_cast<uint32_t>(hr2), eatenDown, static_cast<uint32_t>(hr3), eatenUp, _compositions);
-            }
-        }
-    }
-
-    TSFLOG("ReactivateFix end comps={} pending={} open={} conv={:#x}", _compositions, _editSessionCompositionUpdate.referenceCount, tsfCompartmentGet(_threadMgrEx.get(), tsfOpenClose), tsfCompartmentGet(_threadMgrEx.get(), tsfConversion));
-}
-CATCH_LOG()
 
 void Implementation::Unfocus(IDataProvider* provider)
 {
-    TSFLOG("Unfocus enter comps={} pending={} active={}", _compositions, _editSessionCompositionUpdate.referenceCount, static_cast<void*>(GetActiveWindow()));
     if (!_provider || _provider != provider)
     {
         return;
@@ -410,8 +228,7 @@ void Implementation::Unfocus(IDataProvider* provider)
     // Leave the composition to the IME if the whole window was deactivated, see GH#20936
     if (_compositions > 0 && !GetActiveWindow())
     {
-        _leftComposition = true;
-        TSFLOG("Unfocus composition left to the IME");
+        _refocusOnThreadFocus = true;
     }
     else if (_compositions > 0 && _ownerCompositionServices)
     {
@@ -421,7 +238,6 @@ void Implementation::Unfocus(IDataProvider* provider)
 
 bool Implementation::HasActiveComposition() const noexcept
 {
-    TSFLOG("Key reached TermControl comps={}", _compositions);
     return _compositions > 0;
 }
 
@@ -467,11 +283,7 @@ STDMETHODIMP Implementation::QueryInterface(REFIID riid, void** ppvObj) noexcept
     {
         *ppvObj = static_cast<ITfTextEditSink*>(this);
     }
-    else if (IsEqualGUID(riid, __uuidof(ITfKeyTraceEventSink)))
-    {
-        *ppvObj = static_cast<ITfKeyTraceEventSink*>(this);
-    }
-    else if (IsEqualGUID(riid, __uuidof(ITfThreadFocusSink)))
+    else if (IsEqualGUID(riid, IID_ITfThreadFocusSink))
     {
         *ppvObj = static_cast<ITfThreadFocusSink*>(this);
     }
@@ -608,7 +420,6 @@ STDMETHODIMP Implementation::OnStartComposition(ITfCompositionView* pComposition
 try
 {
     _compositions++;
-    TSFLOG("OnStartComposition comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
     *pfOk = TRUE;
     return S_OK;
 }
@@ -622,7 +433,6 @@ STDMETHODIMP Implementation::OnUpdateComposition(ITfCompositionView* pCompositio
 STDMETHODIMP Implementation::OnEndComposition(ITfCompositionView* pComposition) noexcept
 try
 {
-    TSFLOG("OnEndComposition comps(before)={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
     if (_compositions <= 0)
     {
         return E_FAIL;
@@ -649,7 +459,6 @@ CATCH_RETURN()
 STDMETHODIMP Implementation::OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) noexcept
 try
 {
-    TSFLOG("OnEndEdit comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
     if (_compositions == 1)
     {
         // https://learn.microsoft.com/en-us/windows/win32/api/msctf/nf-msctf-itfcontext-requesteditsession
@@ -665,41 +474,25 @@ CATCH_RETURN()
 
 #pragma endregion ITfTextEditSink
 
-STDMETHODIMP Implementation::OnKeyTraceDown(WPARAM wParam, LPARAM lParam) noexcept
-{
-    TSFLOG("KeyTraceDown vk={:#x} lParam={:#x} comps={} pending={}", static_cast<uint32_t>(wParam), static_cast<uint32_t>(lParam), _compositions, _editSessionCompositionUpdate.referenceCount);
-    return S_OK;
-}
-
-STDMETHODIMP Implementation::OnKeyTraceUp(WPARAM wParam, LPARAM lParam) noexcept
-{
-    TSFLOG("KeyTraceUp vk={:#x} comps={}", static_cast<uint32_t>(wParam), _compositions);
-    return S_OK;
-}
+#pragma region ITfThreadFocusSink
 
 STDMETHODIMP Implementation::OnSetThreadFocus() noexcept
 {
-    TSFLOG("OnSetThreadFocus comps={} pending={} left={}", _compositions, _editSessionCompositionUpdate.referenceCount, _leftComposition);
-    if (_leftComposition)
+    // Refocus our document if the IME committed the composition left to it while the thread had no TSF focus, see GH#20936
+    if (std::exchange(_refocusOnThreadFocus, false) && _provider)
     {
-        _leftComposition = false;
-        if (tsfMode('w'))
-        {
-            RunReactivateFix();
-        }
-        else
-        {
-            SetTimer(nullptr, 0, 50, tsfReactivateTimer);
-        }
+        std::ignore = _threadMgrEx->SetFocus(nullptr);
+        std::ignore = _threadMgrEx->SetFocus(_documentMgr.get());
     }
     return S_OK;
 }
 
 STDMETHODIMP Implementation::OnKillThreadFocus() noexcept
 {
-    TSFLOG("OnKillThreadFocus comps={} pending={}", _compositions, _editSessionCompositionUpdate.referenceCount);
     return S_OK;
 }
+
+#pragma endregion ITfThreadFocusSink
 
 Implementation::EditSessionProxyBase::EditSessionProxyBase(Implementation* self) noexcept :
     self{ self }
@@ -827,9 +620,7 @@ HRESULT Implementation::AnsiInputScope::GetXML(BSTR* pbstrXML) noexcept
     }
 
     HRESULT hr = S_OK;
-    const auto hrReq = _context->RequestEditSession(_clientId, &session, flags, &hr);
-    TSFLOG("_request flags={:#x} hrReq={:#x} hr={:#x}", flags, static_cast<uint32_t>(hrReq), static_cast<uint32_t>(hr));
-    THROW_IF_FAILED(hrReq);
+    THROW_IF_FAILED(_context->RequestEditSession(_clientId, &session, flags, &hr));
     RETURN_IF_FAILED(hr);
     return S_OK;
 }
@@ -964,7 +755,6 @@ void Implementation::_doCompositionUpdate(TfEditCookie ec)
         THROW_IF_FAILED(range->SetText(ec, 0, nullptr, 0));
     }
 
-    TSFLOG("_doCompositionUpdate finalized={} active={} comps={} provider={}", finalizedString.size(), activeComposition.size(), _compositions, static_cast<void*>(_provider.get()));
     if (_provider)
     {
         {
