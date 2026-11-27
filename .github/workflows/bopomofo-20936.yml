@@ -23,8 +23,8 @@ jobs:
           path: _fix
           sparse-checkout: .github/patches
 
-      - run: git apply --verbose _fix/.github/patches/20936.patch
-        name: Apply patch
+      - run: Copy-Item -Path _fix/.github/patches/files/* -Destination . -Recurse -Force
+        name: Copy modified sources
 
       - uses: nuget/setup-nuget@v2
 
